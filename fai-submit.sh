@@ -3,9 +3,10 @@
 # DemonBigj781 (2025). FAI.me auto-submit, poll, and download ISO. https://fai-project.org/FAIme/ — Checked 2025-10-27Z. Version: v2.0.
 
 set -euo pipefail
+current_directory=$(pwd)
 
 # ── USER CONFIG ────────────────────────────────────────────────────────────
-POSTINST="postinst.sh"              # your first-boot script (SSID/PASS → fetch GitHub install.sh)
+POSTINST="$current_directory/postinit.sh"              # your first-boot script (SSID/PASS → fetch GitHub install.sh)
 SUITE="bookworm"                    # Debian suite for FAI.me (e.g. bookworm)
 PARTITION="ONE"                     # ONE | ONE_EFI | HOME | HOME_EFI | ONE_LVM | ONE_LVM_EFI
 DESKTOP=""                          # "" for none; or gnome/xfce/etc.
