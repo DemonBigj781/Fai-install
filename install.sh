@@ -1,184 +1,174 @@
 #!/usr/bin/env bash
-# main-installer.sh  —  Debian 12 (Bookworm)
-# Full multi-GPU desktop (NVIDIA + Intel HD + AMD RX 580 2048SP)
-# Minimal GNOME on Xorg, Docker + NVIDIA CTK, Mono, Steam + Proton-GE, Bottles + Flatseal, extras.
+# Source → Link → Checked (UTC) → Version (APA7-style)
+# DemonBigj781 (2025). Non-interactive multi-GPU system setup for Debian 12/13. — Checked 2025-10-27Z. Version: v1.0.
+
 set -euo pipefail
+
+# ───────────────────────── Non-interactive APT/DPKG ─────────────────────────
 export DEBIAN_FRONTEND=noninteractive
+export NEEDRESTART_MODE=a
+export APT_LISTCHANGES_FRONTEND=none
+APT_FLAGS=(-y -o Dpkg::Options::=--force-confnew -o Dpkg::Options::=--force-confdef)
 
-log() { printf "\n[%s] %s\n" "$(date +%H:%M:%S)" "$*"; }
-apt_install() { apt-get install -y "$@"; }
-try_install() { apt-get install -y "$@" || true; }
+# ─────────────────────────── Defaults (edit if desired) ─────────────────────
+INSTALL_DOCKER=1          # 1=install docker.io and enable service
+INSTALL_MONO=0            # 1=install mono-complete
+INSTALL_FLATPAK=0         # 1=install flatpak + flathub + (no apps by default)
+INSTALL_STEAM=0           # 1=enable i386 + install steam (desktop targets)
+FORCE_XORG_FOR_NVIDIA=1   # 1=disable GNOME Wayland if gdm present
+REBOOT=1                  # 1=reboot automatically if a GPU driver was installed
 
-MAIN_USER="${MAIN_USER:-}"
+# Add the interactive user to 'docker' group if we can infer them:
+MAIN_USER="${SUDO_USER:-}"
 
-log "Updating APT…"
+# ───────────────────────────── Helpers ───────────────────────────────────────
+ts(){ date +'%F %T'; }
+log(){ printf "\n[%s] %s\n" "$(ts)" "$*"; }
+die(){ printf "\n[%s] ERROR: %s\n" "$(ts)" "$*" >&2; exit 1; }
+asroot(){ [ "$EUID" -eq 0 ] || die "Run as root (sudo -s)."; }
+
+# ───────────────────────────── Preamble ──────────────────────────────────────
+asroot
+. /etc/os-release || true
+log "Starting install (ID=${ID:-unknown} VER=${VERSION_ID:-unknown})"
+
 apt-get update -y
-apt_install curl ca-certificates lsb-release gnupg
+apt-get install "${APT_FLAGS[@]}" --no-install-recommends \
+  curl ca-certificates gnupg lsb-release software-properties-common >/dev/null
 
-# -------------------------------------------------------------------
-# Disable Nouveau
-# -------------------------------------------------------------------
-cat >/etc/modprobe.d/blacklist-nouveau.conf <<'EOF'
+# ───────────────────────── GPU detection ─────────────────────────────────────
+GPU="unknown"
+if command -v lspci >/dev/null 2>&1; then
+  LP="$(lspci -nnk 2>/dev/null | tr '[:upper:]' '[:lower:]' || true)"
+  if   grep -q 'nvidia' <<<"$LP"; then GPU="nvidia"
+  elif grep -Eq 'amd|radeon|advanced micro devices' <<<"$LP"; then GPU="amd"
+  elif grep -q 'intel.*(uhd|iris|graphics|vga)' <<<"$LP"; then GPU="intel"
+  fi
+fi
+log "Detected GPU: ${GPU}"
+
+# ───────────────────── Common Mesa/Vulkan userland ───────────────────────────
+apt-get install "${APT_FLAGS[@]}" --no-install-recommends \
+  libgl1-mesa-dri mesa-vulkan-drivers mesa-va-drivers \
+  libvulkan1 vdpauinfo vainfo vulkan-tools vulkan-validationlayers || true
+
+# ───────────────────────────── GPU stacks ────────────────────────────────────
+DRIVER_INSTALLED=0
+
+# NVIDIA path
+if [ "$GPU" = "nvidia" ]; then
+  log "Installing NVIDIA driver + CUDA + persistenced"
+  # Disable nouveau
+  cat >/etc/modprobe.d/blacklist-nouveau.conf <<'EOF'
 blacklist nouveau
 options nouveau modeset=0
 EOF
-update-initramfs -u
+  update-initramfs -u || true
 
-# -------------------------------------------------------------------
-# Mesa / Vulkan stack (common to all GPUs)
-# -------------------------------------------------------------------
-apt_install libgl1-mesa-dri mesa-vulkan-drivers mesa-va-drivers \
-            vdpauinfo vainfo libvulkan1
+  # Driver & CUDA runtime/toolkit
+  apt-get install "${APT_FLAGS[@]}" --no-install-recommends \
+    firmware-misc-nonfree dkms nvidia-detect nvidia-driver \
+    nvidia-cuda-toolkit nvidia-vulkan-icd || true
 
-# -------------------------------------------------------------------
-# Intel + AMD (RX 580 2048SP, Samsung VRAM)
-# -------------------------------------------------------------------
-try_install intel-media-va-driver i965-va-driver
-apt_install firmware-amd-graphics xserver-xorg-video-amdgpu \
-            mesa-vulkan-drivers libgl1-mesa-dri vainfo vdpauinfo
-cat >/etc/modprobe.d/blacklist-radeon.conf <<'EOF'
-blacklist radeon
-EOF
-install -d -m 0755 /etc/X11/xorg.conf.d
-cat >/etc/X11/xorg.conf.d/20-amdgpu.conf <<'EOF'
-Section "Device"
-    Identifier "AMDgpu"
-    Driver "amdgpu"
-    Option "TearFree" "true"
-    Option "VariableRefresh" "true"
-EndSection
-EOF
+  # Persistence daemon
+  apt-get install "${APT_FLAGS[@]}" --no-install-recommends nvidia-persistenced || true
+  systemctl enable nvidia-persistenced || true
 
-# -------------------------------------------------------------------
-# NVIDIA + CUDA + Legacy fallback
-# -------------------------------------------------------------------
-apt_install nvidia-driver firmware-misc-nonfree dkms nvidia-detect \
-           nvidia-vulkan-icd vulkan-tools vulkan-validationlayers
-try_install nvidia-cuda-toolkit
-if ! command -v nvidia-smi >/dev/null 2>&1 || ! nvidia-smi >/dev/null 2>&1; then
-  try_install nvidia-legacy-470xx-driver
-  try_install nvidia-legacy-390xx-driver
+  DRIVER_INSTALLED=1
+
+  # Force GNOME on Xorg if GDM present (Wayland off) for NVIDIA stability
+  if [ "$FORCE_XORG_FOR_NVIDIA" -eq 1 ] && command -v gdm3 >/dev/null 2>&1; then
+    log "Forcing GNOME on Xorg (disabling Wayland)"
+    install -d -m 0755 /etc/gdm3
+    sed -i 's/^#\?WaylandEnable=.*/WaylandEnable=false/' /etc/gdm3/custom.conf 2>/dev/null || \
+      printf "[daemon]\nWaylandEnable=false\n" >/etc/gdm3/custom.conf
+  fi
 fi
-try_install nvidia-persistenced
-systemctl enable nvidia-persistenced || true
 
-# -------------------------------------------------------------------
-# Minimal GNOME on Xorg
-# -------------------------------------------------------------------
-apt_install xorg gnome-core gdm3
-install -d -m 0755 /etc/gdm3
-sed -i 's/^#\?WaylandEnable=.*/WaylandEnable=false/' /etc/gdm3/custom.conf 2>/dev/null || \
-echo -e "[daemon]\nWaylandEnable=false" >/etc/gdm3/custom.conf
-echo "gdm3 shared/default-x-display-manager select gdm3" | debconf-set-selections || true
-systemctl enable gdm3 || true
-systemctl set-default graphical.target || true
-try_install gnome-tweaks gnome-shell-extensions gnome-system-monitor xdg-user-dirs-gtk
+# AMD path
+if [ "$GPU" = "amd" ]; then
+  log "Installing AMD GPU userspace & firmware"
+  apt-get install "${APT_FLAGS[@]}" --no-install-recommends \
+    firmware-amd-graphics xserver-xorg-video-amdgpu || true
 
-# -------------------------------------------------------------------
-# Docker + NVIDIA Container Toolkit
-# -------------------------------------------------------------------
-apt_install docker.io docker-compose
-mkdir -p /usr/share/keyrings
-curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey \
-  > /usr/share/keyrings/nvidia-container-toolkit-archive-keyring.gpg
-DIST=$(. /etc/os-release; echo ${ID}${VERSION_ID})
-curl -sSL https://nvidia.github.io/libnvidia-container/${DIST}/libnvidia-container.list \
-  > /etc/apt/sources.list.d/nvidia-container-toolkit.list
-apt-get update -y
-apt_install nvidia-container-toolkit
-nvidia-ctk runtime configure --runtime=docker || true
-systemctl enable docker || true
-systemctl restart docker || true
-[ -n "$MAIN_USER" ] && id "$MAIN_USER" >/dev/null 2>&1 && usermod -aG docker "$MAIN_USER" || true
+  # Optional ROCm OpenCL (best-effort; availability varies by Debian suite)
+  apt-get install "${APT_FLAGS[@]}" --no-install-recommends rocm-opencl-runtime || true
+fi
 
-# -------------------------------------------------------------------
-# Mono
-# -------------------------------------------------------------------
-apt_install mono-complete
+# Intel path
+if [ "$GPU" = "intel" ]; then
+  log "Installing Intel media VA-API"
+  apt-get install "${APT_FLAGS[@]}" --no-install-recommends \
+    intel-media-va-driver-non-free || true
+fi
 
-# -------------------------------------------------------------------
-# Extra toolchain
-# -------------------------------------------------------------------
-EXTRA_PKGS=(
-  zram-tools nvidia-detect python3.13 python3.13-venv
-  lynx kate nano wine winetricks
-  git gzip unzip wget tig build-essential cmake pkg-config python3-pip diffutils ssh
-  htop nvtop synaptic flatpak wine64 dxvk zip p7zip-full
-  jq git-lfs openssh-server screen debian-archive-keyring firmware-iwlwifi firmware-linux-nonfree
-)
-for pkg in "${EXTRA_PKGS[@]}"; do
-  apt-get install -y "$pkg" || true
-done
+# ───────────────────────── Docker + NVIDIA CTK ───────────────────────────────
+if [ "$INSTALL_DOCKER" -eq 1 ]; then
+  log "Installing Docker engine"
+  apt-get install "${APT_FLAGS[@]}" --no-install-recommends docker.io
+  systemctl enable docker || true
+  systemctl restart docker || true
 
-# -------------------------------------------------------------------
-# Flatpak + Flathub + Bottles + Flatseal
-# -------------------------------------------------------------------
-try_install flatpak
-flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo || true
-flatpak install -y flathub com.usebottles.bottles || true
-flatpak install -y flathub com.github.tchx84.Flatseal || true
+  if [ "$GPU" = "nvidia" ]; then
+    log "Adding NVIDIA Container Toolkit"
+    install -d -m 0755 /usr/share/keyrings
+    curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey \
+      -o /usr/share/keyrings/nvidia-container-toolkit-archive-keyring.gpg || true
+    DIST=$(. /etc/os-release; echo ${ID}${VERSION_ID})
+    curl -fsSL "https://nvidia.github.io/libnvidia-container/${DIST}/libnvidia-container.list" \
+      -o /etc/apt/sources.list.d/nvidia-container-toolkit.list || true
+    apt-get update -y || true
+    apt-get install "${APT_FLAGS[@]}" --no-install-recommends nvidia-container-toolkit || true
+    nvidia-ctk runtime configure --runtime=docker || true
+    systemctl restart docker || true
 
-# -------------------------------------------------------------------
-# Steam + Proton GE
-# -------------------------------------------------------------------
-dpkg --add-architecture i386
-apt-get update -y
-apt_install steam || try_install steam-installer
-try_install libgl1-mesa-dri:i386 mesa-vulkan-drivers:i386 libvulkan1:i386
-try_install nvidia-driver-libs:i386 nvidia-vulkan-icd:i386
-
-log "Installing Proton GE (GloriousEggroll)…"
-STEAM_COMPAT_DIR="/usr/share/steam/compatibilitytools.d"
-mkdir -p "$STEAM_COMPAT_DIR"
-LATEST_GE=$(curl -fsSL https://api.github.com/repos/GloriousEggroll/proton-ge-custom/releases/latest | grep -oP '"tag_name":\s*"\K[^"]+')
-[ -z "$LATEST_GE" ] && LATEST_GE="GE-Proton8-32"   # fallback
-curl -L -o /tmp/proton-ge.tar.gz \
-  "https://github.com/GloriousEggroll/proton-ge-custom/releases/download/${LATEST_GE}/${LATEST_GE}.tar.gz" || true
-tar -xzf /tmp/proton-ge.tar.gz -C "$STEAM_COMPAT_DIR" || true
-log "Installed Proton GE: ${LATEST_GE}"
-
-# -------------------------------------------------------------------
-# CMP 170HX / Tesla V100 tuning (safe for display)
-# -------------------------------------------------------------------
-cat >/usr/local/sbin/nvidia-compute-tune.sh <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-nvidia-modprobe -u -c=0 || true
-nvidia-smi -pm 1 || true
-ACTIVE=$(nvidia-smi --query-gpu=display_active --format=csv,noheader 2>/dev/null | tr '[:upper:]' '[:lower:]' || true)
-if echo "$ACTIVE" | grep -q "enabled"; then exit 0; fi
-COUNT=$(nvidia-smi -L 2>/dev/null | wc -l)
-for i in $(seq 0 $((COUNT-1))); do nvidia-smi -i "$i" -c EXCLUSIVE_PROCESS || true; done
-EOF
-chmod +x /usr/local/sbin/nvidia-compute-tune.sh
-
-cat >/etc/systemd/system/nvidia-compute-tune.service <<'EOF'
-[Unit]
-Description=NVIDIA compute tuning (Persistence + conditional Exclusive Process)
-After=nvidia-persistenced.service multi-user.target
-Requires=nvidia-persistenced.service
-[Service]
-Type=oneshot
-ExecStart=/usr/local/sbin/nvidia-compute-tune.sh
-RemainAfterExit=yes
-[Install]
-WantedBy=multi-user.target
-EOF
-systemctl enable nvidia-persistenced || true
-systemctl enable nvidia-compute-tune.service || true
-
-# -------------------------------------------------------------------
-# GPU-in-container quick test
-# -------------------------------------------------------------------
-cat >/usr/local/bin/test-nvidia-docker <<'EOF'
+    # simple test helper
+    cat >/usr/local/bin/test-nvidia-docker <<'EOF'
 #!/bin/sh
-docker run --rm --gpus all nvidia/cuda:12.5.0-base-ubuntu24.04 nvidia-smi
+exec docker run --rm --gpus all nvidia/cuda:12.5.0-base-ubuntu24.04 nvidia-smi
 EOF
-chmod +x /usr/local/bin/test-nvidia-docker
+    chmod +x /usr/local/bin/test-nvidia-docker
+  fi
 
-log "✅ Installation complete. Reboot to load NVIDIA modules (Nouveau disabled)."
-log "After login (GNOME on Xorg):"
-log "  • GPU-Docker test:  test-nvidia-docker"
-log "  • Steam + Proton GE ready (choose ${LATEST_GE} in game > Properties > Compatibility)"
-log "  • Bottles:          flatpak run com.usebottles.bottles"
-log "  • Flatseal:         flatpak run com.github.tchx84.Flatseal"
+  # Add interactive user to docker group
+  if [ -n "${MAIN_USER}" ] && id "${MAIN_USER}" >/dev/null 2>&1; then
+    usermod -aG docker "${MAIN_USER}" || true
+    log "User '${MAIN_USER}' added to 'docker' group (re-login needed)"
+  fi
+fi
+
+# ───────────────────────── Optional stacks ───────────────────────────────────
+[ "$INSTALL_MONO"   -eq 1 ] && apt-get install "${APT_FLAGS[@]}" --no-install-recommends mono-complete || true
+
+if [ "$INSTALL_FLATPAK" -eq 1 ]; then
+  apt-get install "${APT_FLAGS[@]}" --no-install-recommends flatpak || true
+  flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo || true
+fi
+
+if [ "$INSTALL_STEAM" -eq 1 ]; then
+  dpkg --add-architecture i386
+  apt-get update -y
+  apt-get install "${APT_FLAGS[@]}" --no-install-recommends steam || \
+  apt-get install "${APT_FLAGS[@]}" --no-install-recommends steam-installer || true
+  apt-get install "${APT_FLAGS[@]}" --no-install-recommends \
+    libgl1-mesa-dri:i386 mesa-vulkan-drivers:i386 libvulkan1:i386 || true
+  [ "$GPU" = "nvidia" ] && apt-get install "${APT_FLAGS[@]}" --no-install-recommends \
+    nvidia-driver-libs:i386 nvidia-vulkan-icd:i386 || true
+fi
+
+# ───────────────────────── Summary / Reboot ──────────────────────────────────
+log "Install complete (non-interactive)."
+
+if [ "$REBOOT" -eq 1 ] && [ "$DRIVER_INSTALLED" -eq 1 ]; then
+  log "Rebooting to load new GPU modules…"
+  exec /sbin/reboot
+fi
+
+# If not rebooting automatically, print useful hints:
+if [ "$DRIVER_INSTALLED" -eq 1 ]; then
+  echo "GPU driver installed. Reboot recommended."
+fi
+if [ "$INSTALL_DOCKER" -eq 1 ]; then
+  echo "Docker installed. Try: docker run hello-world"
+  [ "$GPU" = "nvidia" ] && echo "GPU test: test-nvidia-docker"
+fi
